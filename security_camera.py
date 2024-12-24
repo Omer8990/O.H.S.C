@@ -38,7 +38,12 @@ class SecurityCamera:
         self.motion_detected = False
         self.last_notification_time = 0
         self.notification_cooldown = 60
-        
+
+        # Storage settings
+        self.max_days_to_keep = 10  # Keep footage for 10 days
+        self.min_free_space_gb = 1  # Minimum 1GB free space required
+
+
         # Create output directory
         self.output_dir = Path('security_footage')
         self.output_dir.mkdir(exist_ok=True)
@@ -54,6 +59,89 @@ class SecurityCamera:
         
         # Start Telegram command polling
         threading.Thread(target=self._poll_telegram_commands, daemon=True).start()
+        # Start storage management thread
+        threading.Thread(target=self._manage_storage, daemon=True).start()
+
+    def _manage_storage(self):
+        """Manage storage by cleaning up old files and monitoring space"""
+        while True:
+            try:
+                # Clean up old files
+                self._cleanup_old_files()
+
+                # Check free space and clean up if necessary
+                if self._get_free_space() < self.min_free_space_gb:
+                    self._emergency_cleanup()
+
+            except Exception as e:
+                print(f"Error in storage management: {e}")
+
+            # Run every hour
+            time.sleep(3600)
+
+    def _cleanup_old_files(self):
+        """Remove files older than max_days_to_keep"""
+        cutoff_date = datetime.datetime.now() - datetime.timedelta(days=self.max_days_to_keep)
+        cleaned_space = 0
+        files_removed = 0
+
+        for file_path in self.output_dir.glob('motion_*.jpg'):
+            try:
+                # Extract date from filename (motion_YYYYMMDD_HHMMSS.jpg)
+                file_date_str = file_path.stem.split('_')[1]
+                file_date = datetime.datetime.strptime(file_date_str, '%Y%m%d')
+
+                if file_date < cutoff_date:
+                    file_size = file_path.stat().st_size
+                    file_path.unlink()
+                    cleaned_space += file_size
+                    files_removed += 1
+
+            except Exception as e:
+                print(f"Error processing file {file_path}: {e}")
+
+        if files_removed > 0:
+            cleaned_space_mb = cleaned_space / (1024 * 1024)
+            print(f"Storage cleanup: Removed {files_removed} files, freed {cleaned_space_mb:.2f}MB")
+            self.send_telegram_message(
+                f"🧹 Storage cleanup: Removed {files_removed} files older than {self.max_days_to_keep} days\n"
+                f"Freed space: {cleaned_space_mb:.2f}MB"
+            )
+
+    def _emergency_cleanup(self):
+        """Emergency cleanup when running out of space"""
+        try:
+            # Get list of all files sorted by date (oldest first)
+            files = sorted(
+                self.output_dir.glob('motion_*.jpg'),
+                key=lambda x: x.stat().st_mtime
+            )
+
+            # Remove oldest files until we have enough space
+            files_removed = 0
+            space_freed = 0
+
+            for file_path in files:
+                if self._get_free_space() >= self.min_free_space_gb:
+                    break
+
+                file_size = file_path.stat().st_size
+                file_path.unlink()
+                space_freed += file_size
+                files_removed += 1
+
+            if files_removed > 0:
+                space_freed_mb = space_freed / (1024 * 1024)
+                message = (
+                    "⚠️ Emergency storage cleanup performed!\n"
+                    f"Removed {files_removed} oldest files\n"
+                    f"Freed space: {space_freed_mb:.2f}MB\n"
+                    f"Current free space: {self._get_free_space():.2f}GB"
+                )
+                self.send_telegram_message(message)
+
+        except Exception as e:
+            print(f"Error in emergency cleanup: {e}")
 
     def _poll_telegram_commands(self):
         """Poll for and process Telegram commands"""
@@ -89,6 +177,25 @@ class SecurityCamera:
             
         elif command == '/status':
             self._send_status()
+
+        elif command == '/storage':
+            self._send_storage_status()
+
+    def _send_storage_status(self):
+        """Send detailed storage information"""
+        total_files = len(list(self.output_dir.glob('motion_*.jpg')))
+        total_size = sum(f.stat().st_size for f in self.output_dir.glob('motion_*.jpg'))
+        total_size_mb = total_size / (1024 * 1024)
+
+        status_msg = (
+            "📀 *Storage Status*\n"
+            f"💾 Free Space: {self._get_free_space():.2f}GB\n"
+            f"📁 Total Files: {total_files}\n"
+            f"📦 Storage Used: {total_size_mb:.2f}MB\n"
+            f"⏳ Keeping files for: {self.max_days_to_keep} days\n"
+            f"⚠️ Min Free Space: {self.min_free_space_gb}GB"
+        )
+        self.send_telegram_message(status_msg, parse_mode='Markdown')
 
     def _send_status(self):
         """Send system status information"""
